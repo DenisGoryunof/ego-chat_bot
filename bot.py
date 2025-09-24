@@ -10,6 +10,80 @@ from telegram.error import BadRequest
 from dotenv import load_dotenv
 from dateutil import parser
 
+
+async def check_json_reminders(self, context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет напоминания для записей в JSON"""
+    try:
+        with open('bookings.json', 'r', encoding='utf-8') as f:
+            bookings = [json.loads(line) for line in f.readlines()]
+        
+        current_time = datetime.now()
+        
+        for booking in bookings:
+            # Пропускаем неподтвержденные записи
+            if booking.get('status') != 'confirmed':
+                continue
+            
+            try:
+                booking_datetime = datetime.strptime(booking['date'], "%d.%m.%Y %H:%M")
+                
+                # Напоминание за 1 день
+                day_before = booking_datetime - timedelta(days=1)
+                if current_time >= day_before and not booking.get('reminder_sent_day'):
+                    reminder_text = (
+                        f"⏰ *НАПОМИНАНИЕ О ЗАПИСИ*\n\n"
+                        f"Завтра в {booking['date'].split()[1]} у вас запись:\n"
+                        f"💅 *Услуга:* {booking['service']}\n"
+                        f"📅 *Дата и время:* {booking['date']}\n"
+                        f"⏰ *Продолжительность:* {booking['duration']} мин.\n\n"
+                        f"📞 *Контакты студии:* {STUDIO_CONTACTS['phone']}\n"
+                        f"🏠 *Адрес:* {STUDIO_CONTACTS['address']}\n\n"
+                        "⚠️ Пожалуйста, не опаздывайте!"
+                    )
+                    
+                    await context.bot.send_message(
+                        chat_id=booking['chat_id'],
+                        text=reminder_text,
+                        parse_mode='Markdown'
+                    )
+                    
+                    # Помечаем как отправленное (нужно обновить JSON)
+                    booking['reminder_sent_day'] = True
+                    
+                # Напоминание за 1 час
+                hour_before = booking_datetime - timedelta(hours=1)
+                if current_time >= hour_before and not booking.get('reminder_sent_hour'):
+                    reminder_text = (
+                        f"⏰ *СКОРО НАЧНЕТСЯ ПРОЦЕДУРА!*\n\n"
+                        f"Через 1 час у вас запись:\n"
+                        f"💅 *Услуга:* {booking['service']}\n"
+                        f"📅 *Дата и время:* {booking['date']}\n"
+                        f"⏰ *Продолжительность:* {booking['duration']} мин.\n\n"
+                        f"📞 *Контакты студии:* {STUDIO_CONTACTS['phone']}\n"
+                        f"🏠 *Адрес:* {STUDIO_CONTACTS['address']}\n\n"
+                        "🚗 Успейте вовремя!"
+                    )
+                    
+                    await context.bot.send_message(
+                        chat_id=booking['chat_id'],
+                        text=reminder_text,
+                        parse_mode='Markdown'
+                    )
+                    
+                    booking['reminder_sent_hour'] = True
+                    
+            except Exception as e:
+                logger.error(f"Ошибка обработки напоминания: {e}")
+                continue
+        
+        # Обновляем JSON с пометками о напоминаниях
+        with open('bookings.json', 'w', encoding='utf-8') as f:
+            for booking in bookings:
+                json.dump(booking, f, ensure_ascii=False)
+                f.write('\n')
+                
+    except Exception as e:
+        logger.error(f"Ошибка в check_json_reminders: {e}")
 # Загружаем переменные окружения
 load_dotenv()
 
@@ -129,6 +203,7 @@ class BeautySalonBot:
         self.application.add_handler(CommandHandler("bookings_today", self.show_today_bookings))
         self.application.add_handler(CommandHandler("bookings_tomorrow", self.show_tomorrow_bookings))
         self.application.add_handler(CommandHandler("confirm", self.confirm_booking_admin))
+        self.application.job_queue.run_repeating(self.check_json_reminders, interval=300, first=10)
         
         # Обработчик для пагинации
         self.application.add_handler(MessageHandler(filters.Regex(r'^/bookings_\d+$'), self.show_all_bookings))
@@ -150,234 +225,200 @@ class BeautySalonBot:
         # Добавляем задачу проверки напоминаний
         self.application.job_queue.run_repeating(self.check_reminders, interval=300, first=10)  # Проверка каждые 5 минут
 
-    # ==================== НОВЫЕ ФУНКЦИИ ДЛЯ МАСТЕРОВ ====================
+   # ==================== НОВЫЕ ФУНКЦИИ ДЛЯ МАСТЕРОВ ====================
 
-    async def show_all_bookings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает все записи (только для администраторов)"""
-        if update.effective_user.id not in [ADMIN_ALL, ADMIN_MANICURE, ADMIN_OTHER]:
-            await update.message.reply_text("❌ Доступ запрещен")
+async def show_all_bookings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает все записи (только для администраторов)"""
+    if update.effective_user.id not in [ADMIN_ALL, ADMIN_MANICURE, ADMIN_OTHER]:
+        await update.message.reply_text("❌ Доступ запрещен")
+        return
+    
+    try:
+        with open('bookings.json', 'r', encoding='utf-8') as f:
+            bookings = [json.loads(line) for line in f.readlines()]
+        
+        if not bookings:
+            await update.message.reply_text("📊 Записей пока нет")
             return
         
-        try:
-            # Извлекаем номер страницы из команды
-            if update.message.text.startswith('/bookings_'):
-                try:
-                    page = int(update.message.text.split('_')[1])
-                except:
-                    page = 1
-            else:
-                page = int(context.args[0]) if context.args and context.args[0].isdigit() else 1
+        # Сортируем по дате
+        bookings.sort(key=lambda x: datetime.strptime(x['date'], "%d.%m.%Y %H:%M") 
+                     if 'date' in x else datetime.min)
+        
+        # Разбиваем на страницы по 10 записей
+        page = int(context.args[0]) if context.args and context.args[0].isdigit() else 1
+        per_page = 10
+        total_pages = (len(bookings) + per_page - 1) // per_page
+        page = max(1, min(page, total_pages))
+        
+        start_idx = (page - 1) * per_page
+        end_idx = min(start_idx + per_page, len(bookings))
+        
+        bookings_text = f"📋 *ВСЕ ЗАПИСИ (страница {page}/{total_pages}):*\n\n"
+        
+        for i, booking in enumerate(bookings[start_idx:end_idx], start_idx + 1):
+            status_emoji = "✅" if booking.get('status') == 'confirmed' else "⏳"
+            status_text = "Подтверждена" if booking.get('status') == 'confirmed' else "Ожидает"
             
-            conn = sqlite3.connect(DATABASE)
-            cursor = conn.cursor()
+            bookings_text += (
+                f"{i}. {status_emoji} *{booking['service']}*\n"
+                f"   📅 {booking['date']}\n"
+                f"   👤 {booking.get('first_name', '')} {booking.get('last_name', '')}\n"
+                f"   📞 {booking['contacts']}\n"
+                f"   🔢 №{booking['id']}\n"
+                f"   🏷️ Статус: {status_text}\n"
+                f"   👤 User ID: `{booking.get('user_id', '')}`\n\n"
+            )
+        
+        # Добавляем навигацию
+        if total_pages > 1:
+            navigation_text = ""
+            if page > 1:
+                navigation_text += f"⬅️ /bookings_{page-1} "
+            if page < total_pages:
+                navigation_text += f"➡️ /bookings_{page+1}"
             
-            # Получаем все записи, отсортированные по дате
-            cursor.execute('''
-            SELECT * FROM appointments 
-            ORDER BY datetime(substr(date, 7, 4) || '-' || substr(date, 4, 2) || '-' || substr(date, 1, 2) || ' ' || substr(date, 12, 5))
-            ''')
-            
-            bookings = cursor.fetchall()
-            conn.close()
-            
-            if not bookings:
-                await update.message.reply_text("📊 Записей пока нет")
-                return
-            
-            # Разбиваем на страницы по 10 записей
-            per_page = 10
-            total_pages = (len(bookings) + per_page - 1) // per_page
-            page = max(1, min(page, total_pages))
-            
-            start_idx = (page - 1) * per_page
-            end_idx = min(start_idx + per_page, len(bookings))
-            
-            bookings_text = f"📋 *ВСЕ ЗАПИСИ (страница {page}/{total_pages}):*\n\n"
-            
-            for i, booking in enumerate(bookings[start_idx:end_idx], start_idx + 1):
-                status_emoji = "✅" if booking[11] == 'confirmed' else "⏳"
-                status_text = "Подтверждена" if booking[11] == 'confirmed' else "Ожидает"
-                
-                bookings_text += (
-                    f"{i}. {status_emoji} *{booking[1]}*\n"
-                    f"   📅 {booking[2]}\n"
-                    f"   👤 {booking[9] or ''} {booking[10] or ''}\n"
-                    f"   📞 {booking[4]}\n"
-                    f"   🔢 №{booking[0]}\n"
-                    f"   🏷️ Статус: {status_text}\n"
-                    f"   👤 User ID: `{booking[7]}`\n\n"
-                )
-            
-            # Добавляем навигацию
-            if total_pages > 1:
-                navigation_text = ""
-                if page > 1:
-                    navigation_text += f"⬅️ /bookings_{page-1} "
-                if page < total_pages:
-                    navigation_text += f"➡️ /bookings_{page+1}"
-                
-                bookings_text += navigation_text
-            
-            await update.message.reply_text(bookings_text, parse_mode='Markdown')
-            
-        except Exception as e:
-            logger.error(f"Ошибка показа всех записей: {e}")
-            await update.message.reply_text("❌ Ошибка при получении записей")
+            bookings_text += navigation_text
+        
+        await update.message.reply_text(bookings_text, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Ошибка показа всех записей: {e}")
+        await update.message.reply_text("❌ Ошибка при получении записей")
 
-    async def show_today_bookings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает записи на сегодня (только для администраторов)"""
-        if update.effective_user.id not in [ADMIN_ALL, ADMIN_MANICURE, ADMIN_OTHER]:
-            await update.message.reply_text("❌ Доступ запрещен")
+async def show_today_bookings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает записи на сегодня (только для администраторов)"""
+    if update.effective_user.id not in [ADMIN_ALL, ADMIN_MANICURE, ADMIN_OTHER]:
+        await update.message.reply_text("❌ Доступ запрещен")
+        return
+    
+    try:
+        with open('bookings.json', 'r', encoding='utf-8') as f:
+            bookings = [json.loads(line) for line in f.readlines()]
+        
+        today = datetime.now().strftime("%d.%m.%Y")
+        today_bookings = []
+        
+        for booking in bookings:
+            if booking.get('date', '').startswith(today):
+                today_bookings.append(booking)
+        
+        if not today_bookings:
+            await update.message.reply_text(f"📅 На сегодня ({today}) записей нет")
             return
         
-        try:
-            conn = sqlite3.connect(DATABASE)
-            cursor = conn.cursor()
+        # Сортируем по времени
+        today_bookings.sort(key=lambda x: datetime.strptime(x['date'], "%d.%m.%Y %H:%M"))
+        
+        bookings_text = f"📋 *ЗАПИСИ НА СЕГОДНЯ ({today}):*\n\n"
+        
+        for i, booking in enumerate(today_bookings, 1):
+            status_emoji = "✅" if booking.get('status') == 'confirmed' else "⏳"
+            status_text = "Подтверждена" if booking.get('status') == 'confirmed' else "Ожидает"
             
-            today = datetime.now().strftime("%d.%m.%Y")
-            
-            # Получаем записи на сегодня
-            cursor.execute('''
-            SELECT * FROM appointments 
-            WHERE date LIKE ?
-            ORDER BY datetime(substr(date, 7, 4) || '-' || substr(date, 4, 2) || '-' || substr(date, 1, 2) || ' ' || substr(date, 12, 5))
-            ''', (f"{today}%",))
-            
-            bookings = cursor.fetchall()
-            conn.close()
-            
-            if not bookings:
-                await update.message.reply_text(f"📅 На сегодня ({today}) записей нет")
-                return
-            
-            bookings_text = f"📋 *ЗАПИСИ НА СЕГОДНЯ ({today}):*\n\n"
-            
-            for i, booking in enumerate(bookings, 1):
-                status_emoji = "✅" if booking[11] == 'confirmed' else "⏳"
-                status_text = "Подтверждена" if booking[11] == 'confirmed' else "Ожидает"
-                
-                bookings_text += (
-                    f"{i}. {status_emoji} *{booking[1]}*\n"
-                    f"   🕐 {booking[2].split()[1]}\n"
-                    f"   👤 {booking[9] or ''} {booking[10] or ''}\n"
-                    f"   📞 {booking[4]}\n"
-                    f"   🔢 №{booking[0]}\n"
-                    f"   🏷️ Статус: {status_text}\n\n"
-                )
-            
-            await update.message.reply_text(bookings_text, parse_mode='Markdown')
-            
-        except Exception as e:
-            logger.error(f"Ошибка показа записей на сегодня: {e}")
-            await update.message.reply_text("❌ Ошибка при получении записей")
+            bookings_text += (
+                f"{i}. {status_emoji} *{booking['service']}*\n"
+                f"   🕐 {booking['date'].split()[1]}\n"
+                f"   👤 {booking.get('first_name', '')} {booking.get('last_name', '')}\n"
+                f"   📞 {booking['contacts']}\n"
+                f"   🔢 №{booking['id']}\n"
+                f"   🏷️ Статус: {status_text}\n\n"
+            )
+        
+        await update.message.reply_text(bookings_text, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Ошибка показа записей на сегодня: {e}")
+        await update.message.reply_text("❌ Ошибка при получении записей")
 
-    async def show_tomorrow_bookings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает записи на завтра (только для администраторов)"""
-        if update.effective_user.id not in [ADMIN_ALL, ADMIN_MANICURE, ADMIN_OTHER]:
-            await update.message.reply_text("❌ Доступ запрещен")
+async def show_tomorrow_bookings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает записи на завтра (только для администраторов)"""
+    if update.effective_user.id not in [ADMIN_ALL, ADMIN_MANICURE, ADMIN_OTHER]:
+        await update.message.reply_text("❌ Доступ запрещен")
+        return
+    
+    try:
+        with open('bookings.json', 'r', encoding='utf-8') as f:
+            bookings = [json.loads(line) for line in f.readlines()]
+        
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
+        tomorrow_bookings = []
+        
+        for booking in bookings:
+            if booking.get('date', '').startswith(tomorrow):
+                tomorrow_bookings.append(booking)
+        
+        if not tomorrow_bookings:
+            await update.message.reply_text(f"📅 На завтра ({tomorrow}) записей нет")
             return
         
-        try:
-            conn = sqlite3.connect(DATABASE)
-            cursor = conn.cursor()
+        # Сортируем по времени
+        tomorrow_bookings.sort(key=lambda x: datetime.strptime(x['date'], "%d.%m.%Y %H:%M"))
+        
+        bookings_text = f"📋 *ЗАПИСИ НА ЗАВТРА ({tomorrow}):*\n\n"
+        
+        for i, booking in enumerate(tomorrow_bookings, 1):
+            status_emoji = "✅" if booking.get('status') == 'confirmed' else "⏳"
+            status_text = "Подтверждена" if booking.get('status') == 'confirmed' else "Ожидает"
             
-            tomorrow = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
-            
-            # Получаем записи на завтра
-            cursor.execute('''
-            SELECT * FROM appointments 
-            WHERE date LIKE ?
-            ORDER BY datetime(substr(date, 7, 4) || '-' || substr(date, 4, 2) || '-' || substr(date, 1, 2) || ' ' || substr(date, 12, 5))
-            ''', (f"{tomorrow}%",))
-            
-            bookings = cursor.fetchall()
-            conn.close()
-            
-            if not bookings:
-                await update.message.reply_text(f"📅 На завтра ({tomorrow}) записей нет")
-                return
-            
-            bookings_text = f"📋 *ЗАПИСИ НА ЗАВТРА ({tomorrow}):*\n\n"
-            
-            for i, booking in enumerate(bookings, 1):
-                status_emoji = "✅" if booking[11] == 'confirmed' else "⏳"
-                status_text = "Подтверждена" if booking[11] == 'confirmed' else "Ожидает"
-                
-                bookings_text += (
-                    f"{i}. {status_emoji} *{booking[1]}*\n"
-                    f"   🕐 {booking[2].split()[1]}\n"
-                    f"   👤 {booking[9] or ''} {booking[10] or ''}\n"
-                    f"   📞 {booking[4]}\n"
-                    f"   🔢 №{booking[0]}\n"
-                    f"   🏷️ Статус: {status_text}\n\n"
-                )
-            
-            await update.message.reply_text(bookings_text, parse_mode='Markdown')
-            
-        except Exception as e:
-            logger.error(f"Ошибка показа записей на завтра: {e}")
-            await update.message.reply_text("❌ Ошибка при получении записей")
+            bookings_text += (
+                f"{i}. {status_emoji} *{booking['service']}*\n"
+                f"   🕐 {booking['date'].split()[1]}\n"
+                f"   👤 {booking.get('first_name', '')} {booking.get('last_name', '')}\n"
+                f"   📞 {booking['contacts']}\n"
+                f"   🔢 №{booking['id']}\n"
+                f"   🏷️ Статус: {status_text}\n\n"
+            )
+        
+        await update.message.reply_text(bookings_text, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Ошибка показа записей на завтра: {e}")
+        await update.message.reply_text("❌ Ошибка при получении записей")
 
-    async def confirm_booking_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Подтверждение записи администратором"""
-        if update.effective_user.id not in [ADMIN_ALL, ADMIN_MANICURE, ADMIN_OTHER]:
-            await update.message.reply_text("❌ Доступ запрещен")
+async def confirm_booking_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение записи администратором"""
+    if update.effective_user.id not in [ADMIN_ALL, ADMIN_MANICURE, ADMIN_OTHER]:
+        await update.message.reply_text("❌ Доступ запрещен")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ Укажите номер записи: /confirm 123")
+        return
+    
+    try:
+        booking_id = int(context.args[0])
+        
+        # Читаем все записи
+        with open('bookings.json', 'r', encoding='utf-8') as f:
+            bookings = [json.loads(line) for line in f.readlines()]
+        
+        # Ищем запись
+        found = False
+        for booking in bookings:
+            if booking.get('id') == booking_id:
+                booking['status'] = 'confirmed'
+                found = True
+                break
+        
+        if not found:
+            await update.message.reply_text("❌ Запись не найдена")
             return
         
-        if not context.args:
-            await update.message.reply_text("❌ Укажите номер записи: /confirm_123")
-            return
+        # Перезаписываем файл
+        with open('bookings.json', 'w', encoding='utf-8') as f:
+            for booking in bookings:
+                json.dump(booking, f, ensure_ascii=False)
+                f.write('\n')
         
-        try:
-            booking_id = int(context.args[0])
-            conn = sqlite3.connect(DATABASE)
-            cursor = conn.cursor()
-            
-            # Обновляем статус записи
-            cursor.execute('''
-            UPDATE appointments SET status = 'confirmed' WHERE id = ?
-            ''', (booking_id,))
-            
-            if cursor.rowcount == 0:
-                await update.message.reply_text("❌ Запись не найдена")
-            else:
-                # Получаем данные записи для уведомления клиента
-                cursor.execute('SELECT * FROM appointments WHERE id = ?', (booking_id,))
-                booking = cursor.fetchone()
-                
-                # Отправляем уведомление клиенту
-                try:
-                    confirmation_text = (
-                        f"🎉 *ВАША ЗАПИСЬ ПОДТВЕРЖДЕНА!*\n\n"
-                        f"💅 *Услуга:* {booking[1]}\n"
-                        f"📅 *Дата и время:* {booking[2]}\n"
-                        f"⏰ *Продолжительность:* {booking[3]} мин.\n\n"
-                        f"📞 *Наши контакты:* {STUDIO_CONTACTS['phone']}\n"
-                        f"🏠 *Адрес:* {STUDIO_CONTACTS['address']}\n\n"
-                        "⚠️ *Пожалуйста, не опаздывайте!*"
-                    )
-                    
-                    await context.bot.send_message(
-                        chat_id=booking[6],
-                        text=confirmation_text,
-                        parse_mode='Markdown'
-                    )
-                    
-                    await update.message.reply_text(f"✅ Запись #{booking_id} подтверждена. Клиент уведомлен.")
-                    
-                except Exception as e:
-                    logger.error(f"Ошибка уведомления клиента: {e}")
-                    await update.message.reply_text(f"✅ Запись #{booking_id} подтверждена, но не удалось уведомить клиента.")
-            
-            conn.commit()
-            conn.close()
-            
-        except ValueError:
-            await update.message.reply_text("❌ Неверный номер записи")
-        except Exception as e:
-            logger.error(f"Ошибка подтверждения записи: {e}")
-            await update.message.reply_text("❌ Ошибка при подтверждении записи")
-
+        await update.message.reply_text(f"✅ Запись #{booking_id} подтверждена")
+        
+    except ValueError:
+        await update.message.reply_text("❌ Неверный номер записи")
+    except Exception as e:
+        logger.error(f"Ошибка подтверждения записи: {e}")
+        await update.message.reply_text("❌ Ошибка при подтверждении записи")
+        
     # ==================== СУЩЕСТВУЮЩИЕ ФУНКЦИИ ====================
 
     async def check_reminders(self, context: ContextTypes.DEFAULT_TYPE):
@@ -612,31 +653,15 @@ class BeautySalonBot:
             return 1
 
     def save_booking(self, booking_data):
-        """Сохраняет запись в базу данных"""
+        """Сохраняет запись в файл"""
         try:
-            conn = sqlite3.connect(DATABASE)
-            cursor = conn.cursor()
+            # Добавляем поля для напоминаний
+            booking_data['reminder_sent_day'] = False
+            booking_data['reminder_sent_hour'] = False
             
-            cursor.execute('''
-            INSERT INTO appointments 
-            (service, date, duration, contacts, timestamp, chat_id, user_id, username, first_name, last_name, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                booking_data['service'],
-                booking_data['date'],
-                booking_data['duration'],
-                booking_data['contacts'],
-                booking_data['timestamp'],
-                booking_data['chat_id'],
-                booking_data['user_id'],
-                booking_data['username'],
-                booking_data['first_name'],
-                booking_data['last_name'],
-                booking_data['status']
-            ))
-            
-            conn.commit()
-            conn.close()
+            with open('bookings.json', 'a', encoding='utf-8') as f:
+                json.dump(booking_data, f, ensure_ascii=False)
+                f.write('\n')
             return True
         except Exception as e:
             logger.error(f"Ошибка сохранения записи: {e}")
@@ -1305,6 +1330,11 @@ if __name__ == '__main__':
         print("ERROR: Не установлен BOT_TOKEN!")
         print("Установите переменную: export BOT_TOKEN='ваш_токен'")
         exit(1)
-    
+
+    # Создаем файл для записей если его нет
+    if not os.path.exists('bookings.json'):
+        with open('bookings.json', 'w', encoding='utf-8') as f:
+            f.write('')
+
     bot = BeautySalonBot(token)
     bot.run()
