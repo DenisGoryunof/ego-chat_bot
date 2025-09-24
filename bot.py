@@ -1,7 +1,7 @@
-
 import os
 import logging
-import json
+import sqlite3
+import asyncio
 from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ConversationHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -60,12 +60,44 @@ WORKING_HOURS = {
     'end': 19    # 19:00
 }
 
+# Настройки базы данных
+DATABASE = '/home/xDenGor/ego-chat_bot/bookings.db'
+
 class BeautySalonBot:
     def __init__(self, token):
         self.token = token
         # Используем HTTPXRequest для лучшей производительности
         self.application = Application.builder().token(token).request(HTTPXRequest()).build()
         self.setup_handlers()
+        self.init_database()
+        
+    def init_database(self):
+        """Инициализация базы данных"""
+        conn = sqlite3.connect(DATABASE)
+        cursor = conn.cursor()
+        
+        # Таблица записей
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS appointments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            service TEXT NOT NULL,
+            date TEXT NOT NULL,
+            duration INTEGER NOT NULL,
+            contacts TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            status TEXT DEFAULT 'pending',
+            reminder_sent_day BOOLEAN DEFAULT FALSE,
+            reminder_sent_hour BOOLEAN DEFAULT FALSE
+        )
+        ''')
+        
+        conn.commit()
+        conn.close()
         
     def setup_handlers(self):
         # ConversationHandler для записи
@@ -105,6 +137,110 @@ class BeautySalonBot:
         
         # Обработчик для контактов
         self.application.add_handler(MessageHandler(filters.CONTACT, self.handle_contact))
+        
+        # Добавляем задачу проверки напоминаний
+        self.application.job_queue.run_repeating(self.check_reminders, interval=300, first=10)  # Проверка каждые 5 минут
+
+    async def check_reminders(self, context: ContextTypes.DEFAULT_TYPE):
+        """Проверяет и отправляет напоминания"""
+        try:
+            conn = sqlite3.connect(DATABASE)
+            cursor = conn.cursor()
+            
+            current_time = datetime.now()
+            
+            # Напоминание за 1 день
+            day_before = current_time + timedelta(days=1)
+            day_before_date = day_before.strftime("%d.%m.%Y")
+            
+            cursor.execute('''
+            SELECT * FROM appointments 
+            WHERE date LIKE ? 
+            AND reminder_sent_day = FALSE
+            AND status = 'confirmed'
+            ''', (f"{day_before_date}%",))
+            
+            day_reminders = cursor.fetchall()
+            
+            for appointment in day_reminders:
+                try:
+                    # Извлекаем время из даты
+                    appointment_time = appointment[2].split()[1]
+                    
+                    reminder_text = (
+                        f"⏰ *НАПОМИНАНИЕ О ЗАПИСИ*\n\n"
+                        f"Завтра в {appointment_time} у вас запись:\n"
+                        f"💅 *Услуга:* {appointment[1]}\n"
+                        f"📅 *Дата и время:* {appointment[2]}\n"
+                        f"⏰ *Продолжительность:* {appointment[3]} мин.\n\n"
+                        f"📞 *Контакты студии:* {STUDIO_CONTACTS['phone']}\n"
+                        f"🏠 *Адрес:* {STUDIO_CONTACTS['address']}\n\n"
+                        "⚠️ Пожалуйста, не опаздывайте!"
+                    )
+                    
+                    await context.bot.send_message(
+                        chat_id=appointment[6],
+                        text=reminder_text,
+                        parse_mode='Markdown'
+                    )
+                    
+                    # Помечаем как отправленное
+                    cursor.execute('''
+                    UPDATE appointments SET reminder_sent_day = TRUE WHERE id = ?
+                    ''', (appointment[0],))
+                    
+                    logger.info(f"Напоминание за день отправлено для записи #{appointment[0]}")
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка отправки напоминания за день: {e}")
+            
+            # Напоминание за 1 час
+            hour_before = current_time + timedelta(hours=1)
+            hour_before_str = hour_before.strftime("%d.%m.%Y %H:%M")
+            
+            cursor.execute('''
+            SELECT * FROM appointments 
+            WHERE date = ?
+            AND reminder_sent_hour = FALSE
+            AND status = 'confirmed'
+            ''', (hour_before_str,))
+            
+            hour_reminders = cursor.fetchall()
+            
+            for appointment in hour_reminders:
+                try:
+                    reminder_text = (
+                        f"⏰ *СКОРО НАЧНЕТСЯ ПРОЦЕДУРА!*\n\n"
+                        f"Через 1 час у вас запись:\n"
+                        f"💅 *Услуга:* {appointment[1]}\n"
+                        f"📅 *Дата и время:* {appointment[2]}\n"
+                        f"⏰ *Продолжительность:* {appointment[3]} мин.\n\n"
+                        f"📞 *Контакты студии:* {STUDIO_CONTACTS['phone']}\n"
+                        f"🏠 *Адрес:* {STUDIO_CONTACTS['address']}\n\n"
+                        "🚗 Успейте вовремя!"
+                    )
+                    
+                    await context.bot.send_message(
+                        chat_id=appointment[6],
+                        text=reminder_text,
+                        parse_mode='Markdown'
+                    )
+                    
+                    # Помечаем как отправленное
+                    cursor.execute('''
+                    UPDATE appointments SET reminder_sent_hour = TRUE WHERE id = ?
+                    ''', (appointment[0],))
+                    
+                    logger.info(f"Напоминание за час отправлено для записи #{appointment[0]}")
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка отправки напоминания за час: {e}")
+            
+            conn.commit()
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"Ошибка в check_reminders: {e}")
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик всех callback запросов"""
@@ -227,18 +363,41 @@ class BeautySalonBot:
     def get_next_booking_number(self):
         """Генерирует номер записи"""
         try:
-            with open('bookings.json', 'r', encoding='utf-8') as f:
-                bookings = [json.loads(line) for line in f.readlines()]
-            return len(bookings) + 1
+            conn = sqlite3.connect(DATABASE)
+            cursor = conn.cursor()
+            cursor.execute('SELECT MAX(id) FROM appointments')
+            result = cursor.fetchone()
+            conn.close()
+            return (result[0] or 0) + 1
         except:
             return 1
 
     def save_booking(self, booking_data):
-        """Сохраняет запись в файл"""
+        """Сохраняет запись в базу данных"""
         try:
-            with open('bookings.json', 'a', encoding='utf-8') as f:
-                json.dump(booking_data, f, ensure_ascii=False)
-                f.write('\n')
+            conn = sqlite3.connect(DATABASE)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+            INSERT INTO appointments 
+            (service, date, duration, contacts, timestamp, chat_id, user_id, username, first_name, last_name, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                booking_data['service'],
+                booking_data['date'],
+                booking_data['duration'],
+                booking_data['contacts'],
+                booking_data['timestamp'],
+                booking_data['chat_id'],
+                booking_data['user_id'],
+                booking_data['username'],
+                booking_data['first_name'],
+                booking_data['last_name'],
+                booking_data['status']
+            ))
+            
+            conn.commit()
+            conn.close()
             return True
         except Exception as e:
             logger.error(f"Ошибка сохранения записи: {e}")
@@ -247,48 +406,87 @@ class BeautySalonBot:
     def get_user_bookings(self, user_id):
         """Возвращает записи пользователя (только актуальные)"""
         try:
-            with open('bookings.json', 'r', encoding='utf-8') as f:
-                bookings = [json.loads(line) for line in f.readlines()]
+            conn = sqlite3.connect(DATABASE)
+            cursor = conn.cursor()
             
-            # Фильтруем только актуальные записи (не прошедшие)
+            # Получаем все записи пользователя
+            cursor.execute('''
+            SELECT * FROM appointments WHERE user_id = ? ORDER BY id DESC
+            ''', (user_id,))
+            
+            bookings = []
             current_time = datetime.now()
-            user_bookings = []
             
-            for booking in bookings:
-                if booking.get('user_id') == user_id:
-                    # Проверяем, не прошла ли запись
-                    try:
-                        booking_datetime = datetime.strptime(booking['date'], "%d.%m.%Y %H:%M")
-                        if booking_datetime >= current_time:
-                            user_bookings.append(booking)
-                    except:
-                        user_bookings.append(booking)  # Если ошибка формата, все равно показываем
+            for row in cursor.fetchall():
+                # Проверяем, не прошла ли запись
+                try:
+                    booking_datetime = datetime.strptime(row[2], "%d.%m.%Y %H:%M")
+                    if booking_datetime >= current_time:
+                        bookings.append({
+                            'id': row[0],
+                            'service': row[1],
+                            'date': row[2],
+                            'duration': row[3],
+                            'contacts': row[4],
+                            'timestamp': row[5],
+                            'chat_id': row[6],
+                            'user_id': row[7],
+                            'username': row[8],
+                            'first_name': row[9],
+                            'last_name': row[10],
+                            'status': row[11]
+                        })
+                except:
+                    # Если ошибка формата, все равно показываем
+                    bookings.append({
+                        'id': row[0],
+                        'service': row[1],
+                        'date': row[2],
+                        'duration': row[3],
+                        'contacts': row[4],
+                        'timestamp': row[5],
+                        'chat_id': row[6],
+                        'user_id': row[7],
+                        'username': row[8],
+                        'first_name': row[9],
+                        'last_name': row[10],
+                        'status': row[11]
+                    })
             
-            return user_bookings
-        except:
+            conn.close()
+            return bookings
+        except Exception as e:
+            logger.error(f"Ошибка получения записей: {e}")
             return []
 
     def is_time_available(self, selected_datetime, duration_minutes):
         """Проверяет доступно ли время для записи"""
         try:
-            with open('bookings.json', 'r', encoding='utf-8') as f:
-                bookings = [json.loads(line) for line in f.readlines()]
+            conn = sqlite3.connect(DATABASE)
+            cursor = conn.cursor()
             
-            end_datetime = selected_datetime + timedelta(minutes=duration_minutes)
+            # Получаем все записи на эту дату
+            cursor.execute('''
+            SELECT date, duration FROM appointments 
+            WHERE date LIKE ?
+            ''', (f"{selected_datetime.strftime('%d.%m.%Y')}%",))
             
-            for booking in bookings:
+            for row in cursor.fetchall():
                 try:
-                    booking_datetime = datetime.strptime(booking['date'], "%d.%m.%Y %H:%M")
-                    booking_end = booking_datetime + timedelta(minutes=booking.get('duration', 60))
+                    booking_datetime = datetime.strptime(row[0], "%d.%m.%Y %H:%M")
+                    booking_end = booking_datetime + timedelta(minutes=row[1])
                     
                     # Проверяем пересечение временных интервалов
-                    if (selected_datetime < booking_end and end_datetime > booking_datetime):
+                    if (selected_datetime < booking_end and selected_datetime + timedelta(minutes=duration_minutes) > booking_datetime):
+                        conn.close()
                         return False
                 except:
                     continue
             
+            conn.close()
             return True
-        except:
+        except Exception as e:
+            logger.error(f"Ошибка проверки времени: {e}")
             return True
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -775,20 +973,24 @@ class BeautySalonBot:
             return
         
         try:
-            with open('bookings.json', 'r', encoding='utf-8') as f:
-                bookings = [json.loads(line) for line in f.readlines()]
-            total = len(bookings)
+            conn = sqlite3.connect(DATABASE)
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM appointments')
+            total = cursor.fetchone()[0]
             
             # Подсчет актуальных записей
             current_time = datetime.now()
+            cursor.execute('SELECT date FROM appointments')
             active_bookings = 0
-            for booking in bookings:
+            for row in cursor.fetchall():
                 try:
-                    booking_datetime = datetime.strptime(booking['date'], "%d.%m.%Y %H:%M")
+                    booking_datetime = datetime.strptime(row[0], "%d.%m.%Y %H:%M")
                     if booking_datetime >= current_time:
                         active_bookings += 1
                 except:
                     continue
+            
+            conn.close()
             
             stats_text = (
                 f"📊 *СТАТИСТИКА СИСТЕМЫ:*\n\n"
@@ -798,7 +1000,8 @@ class BeautySalonBot:
             )
             
             await update.message.reply_text(stats_text, parse_mode='Markdown')
-        except:
+        except Exception as e:
+            logger.error(f"Ошибка статистики: {e}")
             await update.message.reply_text("📊 Записей пока нет")
 
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -822,28 +1025,34 @@ class BeautySalonBot:
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Статус записей"""
         try:
-            with open('bookings.json', 'r', encoding='utf-8') as f:
-                bookings = [json.loads(line) for line in f.readlines()]
+            conn = sqlite3.connect(DATABASE)
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM appointments')
+            total = cursor.fetchone()[0]
             
             current_time = datetime.now()
+            cursor.execute('SELECT date FROM appointments')
             active_bookings = 0
-            for booking in bookings:
+            for row in cursor.fetchall():
                 try:
-                    booking_datetime = datetime.strptime(booking['date'], "%d.%m.%Y %H:%M")
+                    booking_datetime = datetime.strptime(row[0], "%d.%m.%Y %H:%M")
                     if booking_datetime >= current_time:
                         active_bookings += 1
                 except:
                     continue
             
+            conn.close()
+            
             status_text = (
                 f"📊 *СТАТУС СИСТЕМЫ:*\n\n"
-                f"• Всего записей: {len(bookings)}\n"
+                f"• Всего записей: {total}\n"
                 f"• Актуальных записей: {active_bookings}\n"
                 f"• Система работает нормально ✅"
             )
             
             await update.message.reply_text(status_text, parse_mode='Markdown')
-        except:
+        except Exception as e:
+            logger.error(f"Ошибка статуса: {e}")
             await update.message.reply_text("📊 Записей пока нет\n✅ Система работает нормально")
 
     def run(self):
@@ -858,11 +1067,5 @@ if __name__ == '__main__':
         print("Установите переменную: export BOT_TOKEN='ваш_токен'")
         exit(1)
     
-    # Создаем файл для записей если его нет
-    if not os.path.exists('bookings.json'):
-        with open('bookings.json', 'w', encoding='utf-8') as f:
-            f.write('')
-    
     bot = BeautySalonBot(token)
     bot.run()
-
