@@ -124,6 +124,15 @@ class BeautySalonBot:
         self.application.add_handler(CommandHandler("mybookings", self.show_my_bookings))
         self.application.add_handler(CommandHandler("newbooking", self.new_booking))
         
+        # Новые команды для администраторов
+        self.application.add_handler(CommandHandler("bookings", self.show_all_bookings))
+        self.application.add_handler(CommandHandler("bookings_today", self.show_today_bookings))
+        self.application.add_handler(CommandHandler("bookings_tomorrow", self.show_tomorrow_bookings))
+        self.application.add_handler(CommandHandler("confirm", self.confirm_booking_admin))
+        
+        # Обработчик для пагинации
+        self.application.add_handler(MessageHandler(filters.Regex(r'^/bookings_\d+$'), self.show_all_bookings))
+        
         # Обработчики для кнопок главного меню
         self.application.add_handler(MessageHandler(filters.Regex("^📊 Мои записи$"), self.show_my_bookings))
         self.application.add_handler(MessageHandler(filters.Regex("^ℹ️ О студии$"), self.about_studio))
@@ -140,6 +149,236 @@ class BeautySalonBot:
         
         # Добавляем задачу проверки напоминаний
         self.application.job_queue.run_repeating(self.check_reminders, interval=300, first=10)  # Проверка каждые 5 минут
+
+    # ==================== НОВЫЕ ФУНКЦИИ ДЛЯ МАСТЕРОВ ====================
+
+    async def show_all_bookings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает все записи (только для администраторов)"""
+        if update.effective_user.id not in [ADMIN_ALL, ADMIN_MANICURE, ADMIN_OTHER]:
+            await update.message.reply_text("❌ Доступ запрещен")
+            return
+        
+        try:
+            # Извлекаем номер страницы из команды
+            if update.message.text.startswith('/bookings_'):
+                try:
+                    page = int(update.message.text.split('_')[1])
+                except:
+                    page = 1
+            else:
+                page = int(context.args[0]) if context.args and context.args[0].isdigit() else 1
+            
+            conn = sqlite3.connect(DATABASE)
+            cursor = conn.cursor()
+            
+            # Получаем все записи, отсортированные по дате
+            cursor.execute('''
+            SELECT * FROM appointments 
+            ORDER BY datetime(substr(date, 7, 4) || '-' || substr(date, 4, 2) || '-' || substr(date, 1, 2) || ' ' || substr(date, 12, 5))
+            ''')
+            
+            bookings = cursor.fetchall()
+            conn.close()
+            
+            if not bookings:
+                await update.message.reply_text("📊 Записей пока нет")
+                return
+            
+            # Разбиваем на страницы по 10 записей
+            per_page = 10
+            total_pages = (len(bookings) + per_page - 1) // per_page
+            page = max(1, min(page, total_pages))
+            
+            start_idx = (page - 1) * per_page
+            end_idx = min(start_idx + per_page, len(bookings))
+            
+            bookings_text = f"📋 *ВСЕ ЗАПИСИ (страница {page}/{total_pages}):*\n\n"
+            
+            for i, booking in enumerate(bookings[start_idx:end_idx], start_idx + 1):
+                status_emoji = "✅" if booking[11] == 'confirmed' else "⏳"
+                status_text = "Подтверждена" if booking[11] == 'confirmed' else "Ожидает"
+                
+                bookings_text += (
+                    f"{i}. {status_emoji} *{booking[1]}*\n"
+                    f"   📅 {booking[2]}\n"
+                    f"   👤 {booking[9] or ''} {booking[10] or ''}\n"
+                    f"   📞 {booking[4]}\n"
+                    f"   🔢 №{booking[0]}\n"
+                    f"   🏷️ Статус: {status_text}\n"
+                    f"   👤 User ID: `{booking[7]}`\n\n"
+                )
+            
+            # Добавляем навигацию
+            if total_pages > 1:
+                navigation_text = ""
+                if page > 1:
+                    navigation_text += f"⬅️ /bookings_{page-1} "
+                if page < total_pages:
+                    navigation_text += f"➡️ /bookings_{page+1}"
+                
+                bookings_text += navigation_text
+            
+            await update.message.reply_text(bookings_text, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Ошибка показа всех записей: {e}")
+            await update.message.reply_text("❌ Ошибка при получении записей")
+
+    async def show_today_bookings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает записи на сегодня (только для администраторов)"""
+        if update.effective_user.id not in [ADMIN_ALL, ADMIN_MANICURE, ADMIN_OTHER]:
+            await update.message.reply_text("❌ Доступ запрещен")
+            return
+        
+        try:
+            conn = sqlite3.connect(DATABASE)
+            cursor = conn.cursor()
+            
+            today = datetime.now().strftime("%d.%m.%Y")
+            
+            # Получаем записи на сегодня
+            cursor.execute('''
+            SELECT * FROM appointments 
+            WHERE date LIKE ?
+            ORDER BY datetime(substr(date, 7, 4) || '-' || substr(date, 4, 2) || '-' || substr(date, 1, 2) || ' ' || substr(date, 12, 5))
+            ''', (f"{today}%",))
+            
+            bookings = cursor.fetchall()
+            conn.close()
+            
+            if not bookings:
+                await update.message.reply_text(f"📅 На сегодня ({today}) записей нет")
+                return
+            
+            bookings_text = f"📋 *ЗАПИСИ НА СЕГОДНЯ ({today}):*\n\n"
+            
+            for i, booking in enumerate(bookings, 1):
+                status_emoji = "✅" if booking[11] == 'confirmed' else "⏳"
+                status_text = "Подтверждена" if booking[11] == 'confirmed' else "Ожидает"
+                
+                bookings_text += (
+                    f"{i}. {status_emoji} *{booking[1]}*\n"
+                    f"   🕐 {booking[2].split()[1]}\n"
+                    f"   👤 {booking[9] or ''} {booking[10] or ''}\n"
+                    f"   📞 {booking[4]}\n"
+                    f"   🔢 №{booking[0]}\n"
+                    f"   🏷️ Статус: {status_text}\n\n"
+                )
+            
+            await update.message.reply_text(bookings_text, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Ошибка показа записей на сегодня: {e}")
+            await update.message.reply_text("❌ Ошибка при получении записей")
+
+    async def show_tomorrow_bookings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает записи на завтра (только для администраторов)"""
+        if update.effective_user.id not in [ADMIN_ALL, ADMIN_MANICURE, ADMIN_OTHER]:
+            await update.message.reply_text("❌ Доступ запрещен")
+            return
+        
+        try:
+            conn = sqlite3.connect(DATABASE)
+            cursor = conn.cursor()
+            
+            tomorrow = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
+            
+            # Получаем записи на завтра
+            cursor.execute('''
+            SELECT * FROM appointments 
+            WHERE date LIKE ?
+            ORDER BY datetime(substr(date, 7, 4) || '-' || substr(date, 4, 2) || '-' || substr(date, 1, 2) || ' ' || substr(date, 12, 5))
+            ''', (f"{tomorrow}%",))
+            
+            bookings = cursor.fetchall()
+            conn.close()
+            
+            if not bookings:
+                await update.message.reply_text(f"📅 На завтра ({tomorrow}) записей нет")
+                return
+            
+            bookings_text = f"📋 *ЗАПИСИ НА ЗАВТРА ({tomorrow}):*\n\n"
+            
+            for i, booking in enumerate(bookings, 1):
+                status_emoji = "✅" if booking[11] == 'confirmed' else "⏳"
+                status_text = "Подтверждена" if booking[11] == 'confirmed' else "Ожидает"
+                
+                bookings_text += (
+                    f"{i}. {status_emoji} *{booking[1]}*\n"
+                    f"   🕐 {booking[2].split()[1]}\n"
+                    f"   👤 {booking[9] or ''} {booking[10] or ''}\n"
+                    f"   📞 {booking[4]}\n"
+                    f"   🔢 №{booking[0]}\n"
+                    f"   🏷️ Статус: {status_text}\n\n"
+                )
+            
+            await update.message.reply_text(bookings_text, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Ошибка показа записей на завтра: {e}")
+            await update.message.reply_text("❌ Ошибка при получении записей")
+
+    async def confirm_booking_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Подтверждение записи администратором"""
+        if update.effective_user.id not in [ADMIN_ALL, ADMIN_MANICURE, ADMIN_OTHER]:
+            await update.message.reply_text("❌ Доступ запрещен")
+            return
+        
+        if not context.args:
+            await update.message.reply_text("❌ Укажите номер записи: /confirm_123")
+            return
+        
+        try:
+            booking_id = int(context.args[0])
+            conn = sqlite3.connect(DATABASE)
+            cursor = conn.cursor()
+            
+            # Обновляем статус записи
+            cursor.execute('''
+            UPDATE appointments SET status = 'confirmed' WHERE id = ?
+            ''', (booking_id,))
+            
+            if cursor.rowcount == 0:
+                await update.message.reply_text("❌ Запись не найдена")
+            else:
+                # Получаем данные записи для уведомления клиента
+                cursor.execute('SELECT * FROM appointments WHERE id = ?', (booking_id,))
+                booking = cursor.fetchone()
+                
+                # Отправляем уведомление клиенту
+                try:
+                    confirmation_text = (
+                        f"🎉 *ВАША ЗАПИСЬ ПОДТВЕРЖДЕНА!*\n\n"
+                        f"💅 *Услуга:* {booking[1]}\n"
+                        f"📅 *Дата и время:* {booking[2]}\n"
+                        f"⏰ *Продолжительность:* {booking[3]} мин.\n\n"
+                        f"📞 *Наши контакты:* {STUDIO_CONTACTS['phone']}\n"
+                        f"🏠 *Адрес:* {STUDIO_CONTACTS['address']}\n\n"
+                        "⚠️ *Пожалуйста, не опаздывайте!*"
+                    )
+                    
+                    await context.bot.send_message(
+                        chat_id=booking[6],
+                        text=confirmation_text,
+                        parse_mode='Markdown'
+                    )
+                    
+                    await update.message.reply_text(f"✅ Запись #{booking_id} подтверждена. Клиент уведомлен.")
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка уведомления клиента: {e}")
+                    await update.message.reply_text(f"✅ Запись #{booking_id} подтверждена, но не удалось уведомить клиента.")
+            
+            conn.commit()
+            conn.close()
+            
+        except ValueError:
+            await update.message.reply_text("❌ Неверный номер записи")
+        except Exception as e:
+            logger.error(f"Ошибка подтверждения записи: {e}")
+            await update.message.reply_text("❌ Ошибка при подтверждении записи")
+
+    # ==================== СУЩЕСТВУЮЩИЕ ФУНКЦИИ ====================
 
     async def check_reminders(self, context: ContextTypes.DEFAULT_TYPE):
         """Проверяет и отправляет напоминания"""
